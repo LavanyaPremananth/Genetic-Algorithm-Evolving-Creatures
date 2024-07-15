@@ -1,0 +1,2854 @@
+"""
+creature.py
+
+This script defines the structure and behavior of a creature within a genetic algorithm framework. 
+The Creature class encapsulates the DNA, morphology, and movement of a creature, while the Motor 
+class simulates the behavior of actuators. The creatures are generated based on a genome and are 
+capable of evolving over time to perform tasks such as climbing a mountain.
+"""
+
+import genome 
+from xml.dom.minidom import getDOMImplementation
+from enum import Enum
+import numpy as np
+
+# Enumeration for different types of motor control waveforms
+class MotorType(Enum):
+    PULSE = 1
+    SINE = 2
+
+# Class representing a motor/actuator in the creature
+class Motor:
+    def __init__(self, control_waveform, control_amp, control_freq):
+        # Determine motor type based on the control waveform value
+        if control_waveform <= 0.5:
+            self.motor_type = MotorType.PULSE
+        else:
+            self.motor_type = MotorType.SINE
+        self.amp = control_amp
+        self.freq = control_freq
+        self.phase = 0
+    
+    # Function to calculate the motor output based on its type
+    def get_output(self):
+        self.phase = (self.phase + self.freq) % (np.pi * 2)  # Update the phase based on frequency
+        if self.motor_type == MotorType.PULSE:
+            if self.phase < np.pi:
+                output = 1
+            else:
+                output = -1
+        elif self.motor_type == MotorType.SINE:
+            output = np.sin(self.phase)  # Sine wave output
+        return output 
+
+# Class representing a creature with a genetic blueprint
+class Creature:
+    def __init__(self, gene_count):
+        self.spec = genome.Genome.get_gene_spec()
+        self.dna = genome.Genome.get_random_genome(len(self.spec), gene_count)
+        self.flat_links = None
+        self.exp_links = None
+        self.motors = None
+        self.start_position = None
+        self.last_position = None
+        self.positions = []
+
+    # Function to generate flat links from the genome if not already generated
+    def get_flat_links(self):
+        if self.flat_links == None:
+            gdicts = genome.Genome.get_genome_dicts(self.dna, self.spec)
+            self.flat_links = genome.Genome.genome_to_links(gdicts)
+        return self.flat_links
+    
+    # Function to expand flat links to a full structure
+    def get_expanded_links(self):
+        self.get_flat_links()
+        if self.exp_links is not None:
+            return self.exp_links
+        
+        exp_links = [self.flat_links[0]]
+        genome.Genome.expandLinks(self.flat_links[0], self.flat_links[0].name, self.flat_links, exp_links)
+        self.exp_links = exp_links
+        return self.exp_links
+
+    # Function to generate an XML representation of the creature
+    def to_xml(self):
+        self.get_expanded_links()
+        domimpl = getDOMImplementation()
+        adom = domimpl.createDocument(None, "start", None)
+        robot_tag = adom.createElement("robot")
+        for link in self.exp_links:
+            robot_tag.appendChild(link.to_link_element(adom))
+        first = True
+        for link in self.exp_links:
+            if first:  # Skip the root node
+                first = False
+                continue
+            robot_tag.appendChild(link.to_joint_element(adom))
+        robot_tag.setAttribute("name", "pepe")  # Assign a name to the robot
+        return '<?xml version="1.0"?>' + robot_tag.toprettyxml()
+
+    # Function to retrieve and initialize motors for the creature
+    def get_motors(self):
+        self.get_expanded_links()
+        if self.motors is None:
+            motors = []
+            for i in range(1, len(self.exp_links)):
+                l = self.exp_links[i]
+                m = Motor(l.control_waveform, l.control_amp, l.control_freq)
+                motors.append(m)
+            self.motors = motors 
+        return self.motors 
+    
+    # Function to update the creature's position
+    def update_position(self, pos):
+        if self.start_position is None:
+            self.start_position = pos
+        else:
+            self.last_position = pos
+        self.positions.append(pos)
+
+    # Function to calculate the distance traveled by the creature
+    def get_distance_travelled(self):
+        if self.start_position is None or self.last_position is None:
+            return 0
+        p1 = np.asarray(self.start_position)
+        p2 = np.asarray(self.last_position)
+        dist = np.linalg.norm(p1 - p2)  # Euclidean distance
+        return dist 
+    
+     # Function to calculate the vertical distance between two positions
+    def get_total_vertical_distance_travelled(self):
+        total_vertical_distance = 0
+        for i in range(1, len(self.positions)):
+            p1 = np.asarray(self.positions[i-1])
+            p2 = np.asarray(self.positions[i])
+            vertical_distance = p2[2] - p1[2] 
+            if vertical_distance > 0: 
+                total_vertical_distance += vertical_distance
+        return total_vertical_distance
+
+    # Function to update the DNA of the creature and reset related properties
+    def update_dna(self, dna):
+        self.dna = dna
+        self.flat_links = None
+        self.exp_links = None
+        self.motors = None
+        self.start_position = None
+        self.last_position = None
+
+
+
+
+
+"""
+ cw-envt_copy.py
+
+This script is designed to integrate PyBullet physics simulation with genetic algorithm-controlled creatures 
+navigating through a dynamically generated environment, providing insights into their behavior and performance metrics. 
+Adjustments can be made to the terrain, obstacles, and creature parameters to explore different simulation scenarios.
+ 
+"""
+
+import os 
+import genome
+import sys
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+import pybullet_data
+import math
+import glob
+import matplotlib.pyplot as plt
+
+# Initialize PyBullet in GUI mode and set the search path for additional data
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+# Function to create an arena with walls and floor
+def make_arena(arena_size=10, wall_height=1):
+    wall_thickness = 0.5
+    # Create the floor of the arena
+    floor_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, arena_size / 2, wall_thickness])
+    floor_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, arena_size / 2, wall_thickness], rgbaColor=[1, 1, 0, 1])
+    floor_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=floor_collision_shape, baseVisualShapeIndex=floor_visual_shape, basePosition=[0, 0, -wall_thickness])
+
+    # Create the north and south walls
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, wall_thickness / 2, wall_height / 2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, wall_thickness / 2, wall_height / 2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, arena_size / 2, wall_height / 2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, -arena_size / 2, wall_height / 2])
+
+    # Create the east and west walls
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness / 2, arena_size / 2, wall_height / 2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness / 2, arena_size / 2, wall_height / 2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[arena_size / 2, 0, wall_height / 2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[-arena_size / 2, 0, wall_height / 2])
+
+# Function to create a mountainous terrain with rocks
+def make_mountain(num_rocks=100, max_size=0.25, arena_size=10, mountain_height=5):
+    def gaussian(x, y, sigma=arena_size / 4):
+        """Return the height of the mountain at position (x, y) using a Gaussian function."""
+        return mountain_height * math.exp(-((x ** 2 + y ** 2) / (2 * sigma ** 2)))
+
+    for _ in range(num_rocks):
+        # Randomly position rocks within the arena
+        x = random.uniform(-1 * arena_size / 2, arena_size / 2)
+        y = random.uniform(-1 * arena_size / 2, arena_size / 2)
+        z = gaussian(x, y)  # Height determined by the Gaussian function
+
+        # Adjust the size of the rocks based on height (higher rocks are smaller)
+        size_factor = 1 - (z / mountain_height)
+        size = random.uniform(0.1, max_size) * size_factor
+
+        # Set random orientation for each rock
+        orientation = p.getQuaternionFromEuler([random.uniform(0, math.pi), random.uniform(0, math.pi), random.uniform(0, math.pi)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+# Function to create random rocks in the arena
+def make_rocks(num_rocks=100, max_size=0.25, arena_size=10):
+    for _ in range(num_rocks):
+        x = random.uniform(-1 * arena_size/2, arena_size/2)
+        y = random.uniform(-1 * arena_size/2, arena_size/2)
+        z = 0.5  # Adjust based on your needs
+        size = random.uniform(0.1,max_size)
+        orientation = p.getQuaternionFromEuler([random.uniform(0, 3.14), random.uniform(0, 3.14), random.uniform(0, 3.14)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+# Main function to simulate the environment and control the creature
+def main(csv_file, connection_mode):
+    """
+    Main function to simulate a PyBullet environment where a creature controlled by a genetic algorithm
+    navigates through obstacles and terrain. The creature's behavior is determined by genetic parameters
+    loaded from a CSV file.
+
+    Returns:
+    - dist_moved: Total vertical distance moved by the creature during simulation.
+    """
+    assert os.path.exists(csv_file), "Tried to load " + csv_file + " but it does not exist"
+
+    # PyBullet setup
+    physicsClient = p.connect(connection_mode)
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+    plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+    p.setGravity(0, 0, -10)
+
+    # Parameter Tuning: Experiment with different parameters
+    arena_size = 20
+    num_rocks_list = [50, 100, 150]  # Different numbers of rocks to test
+    mountain_height_list = [3, 5, 7]  # Different mountain heights to test
+
+    results = {}
+
+    for num_rocks in num_rocks_list:
+        for mountain_height in mountain_height_list:
+            print(f"Testing with num_rocks={num_rocks}, mountain_height={mountain_height}")
+            
+            # Create the arena and obstacles
+            make_arena(arena_size=arena_size)
+            make_rocks(num_rocks=num_rocks, arena_size=arena_size)
+            make_mountain(arena_size=arena_size, mountain_height=mountain_height)
+
+    # Create the arena and obstacles
+    # arena_size = 20
+    # make_arena(arena_size=arena_size)
+    # Uncomment to add rocks or mountainous terrain'
+    # make_rocks(arena_size=arena_size)
+    # make_mountain(arena_size=arena_size)
+
+    # Load the mountainous terrain from URDF files
+    mountain_position = (0, 0, -1)
+    mountain_position_2 = (10, -10, 1)
+    mountain_orientation = p.getQuaternionFromEuler((0, 0, 0))
+    p.setAdditionalSearchPath('shapes/')
+    p.loadURDF("gaussian_pyramid.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+    # p.loadURDF("mountain_with_cubes.urdf", mountain_position_2, mountain_orientation, useFixedBase=1)
+
+    # Create a creature using genetic parameters from CSV
+    cr = creature.Creature(gene_count=5)
+    print("Loading DNA from CSV file")
+    dna = genome.Genome.from_csv(csv_file)
+    print("DNA Loaded: ", dna)
+    cr.update_dna(dna)
+    print("Creature DNA updated")
+
+    # Save creature to XML
+    with open('test.urdf', 'w') as f:
+        f.write(cr.to_xml())
+
+    # Load the creature into the simulation
+    rob1 = p.loadURDF('test.urdf', (0, 0, 10))
+
+    # Initialize simulation parameters
+    start_pos, orn = p.getBasePositionAndOrientation(rob1)
+    elapsed_time = 0
+    wait_time = 1.0 / 240
+    total_time = 30
+    step = 0
+    dist_moved = 0
+
+    # Simulation loop
+    while True:
+        p.stepSimulation()
+        step += 1
+        if step % 24 == 0:
+            motors = cr.get_motors()
+            assert len(motors) == p.getNumJoints(rob1), "Something went wrong"
+            for jid in range(p.getNumJoints(rob1)):
+                mode = p.VELOCITY_CONTROL
+                vel = motors[jid].get_output()
+                p.setJointMotorControl2(rob1, jid, controlMode=mode, targetVelocity=vel)
+            new_pos, orn = p.getBasePositionAndOrientation(rob1)
+            dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+            print("new pos", new_pos)
+            print("dist moved", dist_moved)
+        time.sleep(wait_time)
+        elapsed_time += wait_time
+        if elapsed_time > total_time:
+            break
+
+    print("TOTAL DISTANCE MOVED:", dist_moved)
+    # p.disconnect()  # Uncomment to disconnect from PyBullet simulation
+    return dist_moved
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python cw-envt_copy.py csv_filename")
+        sys.exit(1)
+    
+    csv_filename = sys.argv[1]
+    main("ga_output.csv", p.DIRECT)  # Adjust as per your script's requirements
+
+
+
+
+"""
+cw-envt.py
+
+This script sets up a PyBullet simulation environment for testing creatures evolved using a genetic algorithm.
+It includes the creation of an arena with walls and a mountain using Gaussian distribution for the creatures to climb.
+The script also loads a creature from a genetic algorithm into the simulation and runs the simulation in real-time.
+"""
+
+import pybullet as p
+import pybullet_data
+import time
+import numpy as np
+import random
+import creature
+import math
+
+# Initialize PyBullet in GUI mode and set the search path for additional data
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+
+# Adjust camera distance to zoom out
+camera_distance = 25.0  # Adjust this value as needed
+camera_yaw = 0
+camera_pitch = -30
+p.resetDebugVisualizerCamera(camera_distance, camera_yaw, camera_pitch, [0, 0, 0])
+
+# Function to create a mountain using a Gaussian distribution
+def make_mountain(num_rocks=100, max_size=0.25, arena_size=10, mountain_height=5):
+    def gaussian(x, y, sigma=arena_size / 4):
+        """Return the height of the mountain at position (x, y) using a Gaussian function."""
+        return mountain_height * math.exp(-((x ** 2 + y ** 2) / (2 * sigma ** 2)))
+
+    for _ in range(num_rocks):
+        # Randomly position rocks within the arena
+        x = random.uniform(-1 * arena_size / 2, arena_size / 2)
+        y = random.uniform(-1 * arena_size / 2, arena_size / 2)
+        z = gaussian(x, y)  # Height determined by the Gaussian function
+
+        # Adjust the size of the rocks based on height (higher rocks are smaller)
+        size_factor = 1 - (z / mountain_height)
+        size = random.uniform(0.1, max_size) * size_factor
+
+        # Set random orientation for each rock
+        orientation = p.getQuaternionFromEuler([random.uniform(0, math.pi), random.uniform(0, math.pi), random.uniform(0, math.pi)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+# Function to create rocks
+def make_rocks(num_rocks=100, max_size=0.25, arena_size=10):
+    for _ in range(num_rocks):
+        x = random.uniform(-1 * arena_size/2, arena_size/2)
+        y = random.uniform(-1 * arena_size/2, arena_size/2)
+        z = 0.5  # Adjust based on your needs
+        size = random.uniform(0.1,max_size)
+        orientation = p.getQuaternionFromEuler([random.uniform(0, 3.14), random.uniform(0, 3.14), random.uniform(0, 3.14)])
+        rock_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[size, size, size])
+        rock_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=[size, size, size], rgbaColor=[0.5, 0.5, 0.5, 1])
+        rock_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=rock_shape, baseVisualShapeIndex=rock_visual, basePosition=[x, y, z], baseOrientation=orientation)
+
+# Function to create an arena with walls
+def make_arena(arena_size=10, wall_height=1):
+    wall_thickness = 0.5
+    # Create the floor of the arena
+    floor_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, arena_size / 2, wall_thickness])
+    floor_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, arena_size / 2, wall_thickness], rgbaColor=[1, 1, 0, 1])
+    floor_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=floor_collision_shape, baseVisualShapeIndex=floor_visual_shape, basePosition=[0, 0, -wall_thickness])
+
+    # Create the north and south walls
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, wall_thickness / 2, wall_height / 2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[arena_size / 2, wall_thickness / 2, wall_height / 2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, arena_size / 2, wall_height / 2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[0, -arena_size / 2, wall_height / 2])
+
+    # Create the east and west walls
+    wall_collision_shape = p.createCollisionShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness / 2, arena_size / 2, wall_height / 2])
+    wall_visual_shape = p.createVisualShape(shapeType=p.GEOM_BOX, halfExtents=[wall_thickness / 2, arena_size / 2, wall_height / 2], rgbaColor=[0.7, 0.7, 0.7, 1])  # Gray walls
+
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[arena_size / 2, 0, wall_height / 2])
+    p.createMultiBody(baseMass=0, baseCollisionShapeIndex=wall_collision_shape, baseVisualShapeIndex=wall_visual_shape, basePosition=[-arena_size / 2, 0, wall_height / 2])
+
+# Set gravity for the simulation
+p.setGravity(0, 0, -10)
+
+# Create the arena and mountain
+arena_size = 20
+make_arena(arena_size=arena_size)
+mountain_position = (0, 0, -1)  # Position of the mountain (adjust as needed)
+mountain_orientation = p.getQuaternionFromEuler((0, 0, 0))
+p.setAdditionalSearchPath('shapes/')
+mountain = p.loadURDF("gaussian_pyramid.urdf", mountain_position, mountain_orientation, useFixedBase=1)
+
+# Load and control the creature
+cr = creature.Creature(gene_count=10)  # Initialize creature with a specified gene count
+
+# Save creature to XML
+with open('test.urdf', 'w') as f:
+    f.write(cr.to_xml())
+
+# Load the creature into the simulation
+rob1 = p.loadURDF('test.urdf', (0, 0, 10))
+
+# Enable real-time simulation and start the simulation loop
+p.setRealTimeSimulation(1)
+while True:
+    time.sleep(0.1)  # Adjust time step as necessary for your simulation
+
+
+
+
+"""
+genome.py 
+
+This code defines classes and methods for manipulating genetic data (genome) 
+and creating URDF links and joints for robotics simulations.
+"""
+import numpy as np
+import copy 
+import random
+
+class Genome():
+    @staticmethod 
+    def get_random_gene(length):
+        # Generate a random gene of specified length
+        gene = np.array([np.random.random() for i in range(length)])
+        return gene
+    
+    @staticmethod 
+    def get_random_genome(gene_length, gene_count):
+        # Generate a random genome consisting of multiple random genes
+        genome = [Genome.get_random_gene(gene_length) for i in range(gene_count)]
+        return genome
+
+    @staticmethod
+    def get_gene_spec():
+        # Define specifications for each gene type in the genome
+        gene_spec =  {"link-shape":{"scale":1}, 
+            "link-length": {"scale":2},
+            "link-radius": {"scale":1},
+            "link-recurrence": {"scale":3},
+            "link-mass": {"scale":1},
+            "joint-type": {"scale":1},
+            "joint-parent":{"scale":1},
+            "joint-axis-xyz": {"scale":1},
+            "joint-origin-rpy-1":{"scale":np.pi * 2},
+            "joint-origin-rpy-2":{"scale":np.pi * 2},
+            "joint-origin-rpy-3":{"scale":np.pi * 2},
+            "joint-origin-xyz-1":{"scale":1},
+            "joint-origin-xyz-2":{"scale":1},
+            "joint-origin-xyz-3":{"scale":1},
+            "control-waveform":{"scale":1},
+            "control-amp":{"scale":0.25},
+            "control-freq":{"scale":1}
+            }
+        ind = 0
+        for key in gene_spec.keys():
+            gene_spec[key]["ind"] = ind
+            ind = ind + 1
+        return gene_spec
+    
+    @staticmethod
+    def get_gene_dict(gene, spec):
+        gdict = {}
+        for key in spec:
+            ind = spec[key]["ind"]
+            scale = spec[key]["scale"]
+            gdict[key] = gene[ind] * scale
+        return gdict
+
+    @staticmethod
+    def get_genome_dicts(genome, spec):
+        # Convert a genome (list of genes) into a list of dictionaries based on given specifications
+        gdicts = []
+        for gene in genome:
+            gdicts.append(Genome.get_gene_dict(gene, spec))
+        return gdicts
+
+    @staticmethod
+    def expandLinks(parent_link, uniq_parent_name, flat_links, exp_links):
+        # Recursively expand links in a hierarchical structure
+        children = [l for l in flat_links if l.parent_name == parent_link.name]
+        sibling_ind = 1
+        for c in children:
+            for r in range(int(c.recur)):
+                sibling_ind  = sibling_ind +1
+                c_copy = copy.copy(c)
+                c_copy.parent_name = uniq_parent_name
+                uniq_name = c_copy.name + str(len(exp_links))
+                c_copy.name = uniq_name
+                c_copy.sibling_ind = sibling_ind
+                exp_links.append(c_copy)
+                assert c.parent_name != c.name, "Genome::expandLinks: link joined to itself: " + c.name + " joins " + c.parent_name 
+                Genome.expandLinks(c, uniq_name, flat_links, exp_links)
+
+    @staticmethod
+    def genome_to_links(gdicts):
+        # Convert a genome in structured dictionaries into a list of URDFLink objects
+        links = []
+        link_ind = 0
+        parent_names = [str(link_ind)]
+        for gdict in gdicts:
+            link_name = str(link_ind)
+            parent_ind = gdict["joint-parent"] * len(parent_names)
+            assert parent_ind < len(parent_names), "genome.py: parent ind too high: " + str(parent_ind) + "got: " + str(parent_names)
+            parent_name = parent_names[int(parent_ind)]
+            recur = gdict["link-recurrence"]
+            link = URDFLink(name=link_name, 
+                            parent_name=parent_name, 
+                            recur=recur+1, 
+                            link_length=gdict["link-length"], 
+                            link_radius=gdict["link-radius"], 
+                            link_mass=gdict["link-mass"],
+                            joint_type=gdict["joint-type"],
+                            joint_parent=gdict["joint-parent"],
+                            joint_axis_xyz=gdict["joint-axis-xyz"],
+                            joint_origin_rpy_1=gdict["joint-origin-rpy-1"],
+                            joint_origin_rpy_2=gdict["joint-origin-rpy-2"],
+                            joint_origin_rpy_3=gdict["joint-origin-rpy-3"],
+                            joint_origin_xyz_1=gdict["joint-origin-xyz-1"],
+                            joint_origin_xyz_2=gdict["joint-origin-xyz-2"],
+                            joint_origin_xyz_3=gdict["joint-origin-xyz-3"],
+                            control_waveform=gdict["control-waveform"],
+                            control_amp=gdict["control-amp"],
+                            control_freq=gdict["control-freq"])
+            links.append(link)
+            if link_ind != 0:  # Don't re-add the first link
+                parent_names.append(link_name)
+            link_ind = link_ind + 1
+
+        # Fix the first link so it links to nothing
+        links[0].parent_name = "None"
+        return links
+
+
+    @staticmethod 
+    def crossover(g1, g2):
+        # Perform crossover between two genomes at random points
+        x1 = random.randint(0, len(g1)-1)
+        x2 = random.randint(0, len(g2)-1)
+        g3 = np.concatenate((g1[x1:], g2[x2:])) 
+        if len(g3) > len(g1):
+            g3 = g3[0:len(g1)] 
+        return g3
+
+    @staticmethod
+    def point_mutate(genome, rate, amount):
+        # Mutate a genome by adding a fixed amount to random genes based on a mutation rate
+        new_genome = copy.copy(genome)
+        for gene in new_genome:
+            for i in range(len(gene)):
+                if random.random() < rate:
+                    gene[i] += amount
+                if gene[i] >= 1.0:
+                    gene[i] = 0.9999
+                if gene[i] < 0.0:
+                    gene[i] = 0.0
+        return new_genome
+
+    @staticmethod
+    def shrink_mutate(genome, rate):
+        # Mutate a genome by randomly removing a gene if possible
+        if len(genome) == 1:
+            return copy.copy(genome)
+        if random.random() < rate:
+            ind = random.randint(0, len(genome)-1)
+            new_genome = np.delete(genome, ind, 0)
+            return new_genome
+        else:
+            return copy.copy(genome)
+
+    @staticmethod
+    def grow_mutate(genome, rate):
+        # Mutate a genome by adding a random gene with the same length as existing genes
+        if random.random() < rate:
+            gene = Genome.get_random_gene(len(genome[0]))
+            new_genome = copy.copy(genome)
+            new_genome = np.append(new_genome, [gene], axis=0)
+            return new_genome
+        else:
+            return copy.copy(genome)
+
+    @staticmethod
+    def to_csv(dna, csv_file):
+        # Convert genome data into a CSV file format
+        csv_str = ""
+        for gene in dna:
+            for val in gene:
+                csv_str = csv_str + str(val) + ","
+            csv_str = csv_str + '\n'
+
+        with open(csv_file, 'w') as f:
+            f.write(csv_str)
+
+    @staticmethod
+    def from_csv(filename):
+        # Read genome data from a CSV file
+        csv_str = ''
+        with open(filename) as f:
+            csv_str = f.read()   
+        dna = []
+        lines = csv_str.split('\n')
+        for line in lines:
+            vals = line.split(',')
+            gene = [float(v) for v in vals if v != '']
+            if len(gene) > 0:
+                dna.append(gene)
+        return dna
+
+class URDFLink:
+    def __init__(self, name, parent_name, recur, 
+                link_length=0.1, 
+                link_radius=0.1, 
+                link_mass=0.1,
+                joint_type=0.1,
+                joint_parent=0.1,
+                joint_axis_xyz=0.1,
+                joint_origin_rpy_1=0.1,
+                joint_origin_rpy_2=0.1,
+                joint_origin_rpy_3=0.1,
+                joint_origin_xyz_1=0.1,
+                joint_origin_xyz_2=0.1,
+                joint_origin_xyz_3=0.1,
+                control_waveform=0.1,
+                control_amp=0.1,
+                control_freq=0.1):
+        # Initialize parameters for a URDF link and joint
+        self.name = name
+        self.parent_name = parent_name
+        self.recur = recur 
+        self.link_length=link_length 
+        self.link_radius=link_radius
+        self.link_mass=link_mass
+        self.joint_type=joint_type
+        self.joint_parent=joint_parent
+        self.joint_axis_xyz=joint_axis_xyz
+        self.joint_origin_rpy_1=joint_origin_rpy_1
+        self.joint_origin_rpy_2=joint_origin_rpy_2
+        self.joint_origin_rpy_3=joint_origin_rpy_3
+        self.joint_origin_xyz_1=joint_origin_xyz_1
+        self.joint_origin_xyz_2=joint_origin_xyz_2
+        self.joint_origin_xyz_3=joint_origin_xyz_3
+        self.control_waveform=control_waveform
+        self.control_amp=control_amp
+        self.control_freq=control_freq
+        self.sibling_ind = 1
+
+    def to_link_element(self, adom):
+        # Generate an XML element for the URDF link
+        link_tag = adom.createElement("link")
+        link_tag.setAttribute("name", self.name)
+        vis_tag = adom.createElement("visual")
+        geom_tag = adom.createElement("geometry")
+        cyl_tag = adom.createElement("cylinder")
+        cyl_tag.setAttribute("length", str(self.link_length))
+        cyl_tag.setAttribute("radius", str(self.link_radius))
+        
+        geom_tag.appendChild(cyl_tag)
+        vis_tag.appendChild(geom_tag)
+        
+        coll_tag = adom.createElement("collision")
+        c_geom_tag = adom.createElement("geometry")
+        c_cyl_tag = adom.createElement("cylinder")
+        c_cyl_tag.setAttribute("length", str(self.link_length))
+        c_cyl_tag.setAttribute("radius", str(self.link_radius))
+        
+        c_geom_tag.appendChild(c_cyl_tag)
+        coll_tag.appendChild(c_geom_tag)
+        
+        inertial_tag = adom.createElement("inertial")
+        mass_tag = adom.createElement("mass")
+        mass = np.pi * (self.link_radius * self.link_radius) * self.link_length
+        mass_tag.setAttribute("value", str(mass))
+        inertia_tag = adom.createElement("inertia")
+        inertia_tag.setAttribute("ixx", "0.03")
+        inertia_tag.setAttribute("iyy", "0.03")
+        inertia_tag.setAttribute("izz", "0.03")
+        inertia_tag.setAttribute("ixy", "0")
+        inertia_tag.setAttribute("ixz", "0")
+        inertia_tag.setAttribute("iyx", "0")
+        inertial_tag.appendChild(mass_tag)
+        inertial_tag.appendChild(inertia_tag)
+
+        link_tag.appendChild(vis_tag)
+        link_tag.appendChild(coll_tag)
+        link_tag.appendChild(inertial_tag)
+        
+        return link_tag
+
+    def to_joint_element(self, adom):
+        # Generate an XML element for the URDF joint
+        joint_tag = adom.createElement("joint")
+        joint_tag.setAttribute("name", self.name + "_to_" + self.parent_name)
+        if self.joint_type >= 0.5:
+            joint_tag.setAttribute("type", "revolute")
+        else:
+            joint_tag.setAttribute("type", "revolute")
+        parent_tag = adom.createElement("parent")
+        parent_tag.setAttribute("link", self.parent_name)
+        child_tag = adom.createElement("child")
+        child_tag.setAttribute("link", self.name)
+        axis_tag = adom.createElement("axis")
+        if self.joint_axis_xyz <= 0.33:
+            axis_tag.setAttribute("xyz", "1 0 0")
+        if self.joint_axis_xyz > 0.33 and self.joint_axis_xyz <= 0.66:
+            axis_tag.setAttribute("xyz", "0 1 0")
+        if self.joint_axis_xyz > 0.66:
+            axis_tag.setAttribute("xyz", "0 0 1")
+        
+        limit_tag = adom.createElement("limit")
+        limit_tag.setAttribute("effort", "1")
+        limit_tag.setAttribute("upper", "-3.1415")
+        limit_tag.setAttribute("lower", "3.1415")
+        limit_tag.setAttribute("velocity", "1")
+        
+        orig_tag = adom.createElement("origin")
+        
+        rpy1 = self.joint_origin_rpy_1 * self.sibling_ind
+        rpy = str(rpy1) + " " + str(self.joint_origin_rpy_2) + " " + str(self.joint_origin_rpy_3)
+        
+        orig_tag.setAttribute("rpy", rpy)
+        xyz = str(self.joint_origin_xyz_1) + " " + str(self.joint_origin_xyz_2) + " " + str(self.joint_origin_xyz_3)
+        orig_tag.setAttribute("xyz", xyz)
+
+        joint_tag.appendChild(parent_tag)
+        joint_tag.appendChild(child_tag)
+        joint_tag.appendChild(axis_tag)
+        joint_tag.appendChild(limit_tag)
+        joint_tag.appendChild(orig_tag)
+        
+        return joint_tag
+
+
+
+
+"""
+motor_test.py
+
+This script utilizes the PyBullet physics engine to simulate and manipulate 
+a virtual creature defined by genetic parameters. 
+
+Simulation Setup: Initializes a PyBullet simulation environment with a GUI, 
+sets up a ground plane, and configures simulation parameters like gravity.
+
+Creature Generation: Creates a random creature using genetic parameters 
+defined in the creature module, then exports it to a URDF file (test.urdf) 
+for simulation.
+
+Simulation Loop: Steps through the simulation, updating the creature's 
+movement and calculating the distance moved over time. It controls the 
+creature's joints based on genetic motor outputs.
+
+Output: Prints and finally logs the total distance moved by the creature 
+during the simulation.
+"""
+
+import genome
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+
+# Initialize PyBullet simulation environment with GUI
+p.connect(p.GUI)
+p.setPhysicsEngineParameter(enableFileCaching=0)
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+
+# Create a ground plane for the simulation
+plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+floor = p.createMultiBody(plane_shape, plane_shape)
+
+# Set gravity for the simulation
+p.setGravity(0, 0, -10)
+# (Commenting out real-time simulation setting for Mac compatibility)
+# p.setRealTimeSimulation(1)
+
+# Generate a random creature using 3 genes
+cr = creature.Creature(gene_count=3)
+
+# Save the creature as a URDF file for simulation
+with open('test.urdf', 'w') as f:
+    f.write(cr.to_xml())
+
+# Load the creature into the simulation
+rob1 = p.loadURDF('test.urdf')
+start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+# Simulation parameters
+elapsed_time = 0
+wait_time = 1.0 / 240  # Simulation time step in seconds
+total_time = 5  # Total simulation time in seconds
+step = 0
+dist_moved = 0
+
+# Simulation loop
+while True:
+    p.stepSimulation()
+    step += 1
+
+    # Update motor controls for the creature every 2 seconds (120 simulation steps)
+    if step % 120 == 0:
+        motors = cr.get_motors()
+        assert len(motors) == p.getNumJoints(rob1), "Number of motors doesn't match number of joints"
+
+        # Set velocity control for each joint based on genetic motor outputs
+        for jid in range(p.getNumJoints(rob1)):
+            mode = p.VELOCITY_CONTROL
+            vel = motors[jid].get_output()
+            p.setJointMotorControl2(rob1, jid, controlMode=mode, targetVelocity=vel)
+
+        # Calculate and print the distance moved by the creature
+        new_pos, orn = p.getBasePositionAndOrientation(rob1)
+        dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+        print("Distance moved:", dist_moved)
+
+    # Control simulation rate
+    time.sleep(wait_time)
+    elapsed_time += wait_time
+
+    # Break out of loop after total_time seconds
+    if elapsed_time > total_time:
+        break
+
+# Print the total distance moved by the creature during the simulation
+print("TOTAL DISTANCE MOVED:", dist_moved)
+
+
+
+
+
+"""
+
+offline_from_csv.py
+
+ This script conducts a PyBullet simulation to test a creature's behavior using genetic parameters loaded from a CSV file.
+ It initializes a simulation environment with a ground plane, generates a random creature based on genetic data,
+ loads the creature into the simulation, and then runs a simulation loop. During each simulation step, it controls
+ the creature's joints based on genetic motor outputs and calculates the distance moved by the creature over time.
+""" 
+import os 
+import genome
+import sys
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+
+# Function to run the main simulation
+def main(csv_file):
+    # Check if the specified CSV file exists
+    assert os.path.exists(csv_file), "Tried to load " + csv_file + " but it does not exist"
+
+    # Connect to the PyBullet physics simulation (DIRECT mode for headless operation)
+    p.connect(p.DIRECT)
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+
+    # Create a ground plane for the simulation
+    plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+    floor = p.createMultiBody(plane_shape, plane_shape)
+
+    # Set gravity for the simulation
+    p.setGravity(0, 0, -10)
+    # (Commenting out real-time simulation setting for now)
+    # p.setRealTimeSimulation(1)
+
+    # Generate a random creature with 1 gene (for simplicity in this example)
+    cr = creature.Creature(gene_count=1)
+
+    # Load genetic data from the CSV file and update the creature's DNA
+    dna = genome.Genome.from_csv(csv_file)
+    cr.update_dna(dna)
+
+    # Save the creature as a URDF file for simulation
+    with open('test.urdf', 'w') as f:
+        f.write(cr.to_xml())
+
+    # Load the creature into the simulation
+    rob1 = p.loadURDF('test.urdf')
+
+    # Position the creature in the air
+    p.resetBasePositionAndOrientation(rob1, [0, 0, 2.5], [0, 0, 0, 1])
+
+    # Get the initial position of the creature
+    start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+    # Simulation parameters
+    elapsed_time = 0
+    wait_time = 1.0 / 240  # Simulation time step in seconds
+    total_time = 30  # Total simulation time in seconds
+    step = 0
+
+    # Simulation loop
+    while True:
+        p.stepSimulation()
+        step += 1
+
+        # Update motor controls for the creature every 1 second (24 simulation steps)
+        if step % 24 == 0:
+            motors = cr.get_motors()
+            assert len(motors) == p.getNumJoints(rob1), "Number of motors doesn't match number of joints"
+
+            # Set velocity control for each joint based on genetic motor outputs
+            for jid in range(p.getNumJoints(rob1)):
+                mode = p.VELOCITY_CONTROL
+                vel = motors[jid].get_output()
+                p.setJointMotorControl2(rob1, jid, controlMode=mode, targetVelocity=vel)
+
+            # Calculate and print the distance moved by the creature
+            new_pos, orn = p.getBasePositionAndOrientation(rob1)
+            dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+            print("Distance moved:", dist_moved)
+
+        # Uncomment the line below to simulate in real-time (commented for batch processing)
+        # time.sleep(wait_time)
+
+        elapsed_time += wait_time
+
+        # Break out of loop after total_time seconds
+        if elapsed_time > total_time:
+            break
+
+    # Print the total distance moved by the creature during the simulation
+    print("TOTAL DISTANCE MOVED:", dist_moved)
+
+
+if __name__ == "__main__":
+    # Check if the script is run with the correct command line arguments
+    assert len(sys.argv) == 2, "Usage: python playback_test.py csv_filename"
+    main(sys.argv[1])
+
+
+
+
+"""
+population.py 
+
+This Population class is designed to manage a population of creatures, 
+where each creature has a set of genetic parameters (gene_count). 
+
+It provides methods to initialize a population (__init__), 
+generate a cumulative fitness map based on fitness values (get_fitness_map), 
+and select a parent index based on the fitness map using stochastic universal sampling (select_parent). 
+"""
+
+import creature 
+import numpy as np
+
+class Population:
+    def __init__(self, pop_size, gene_count):
+        """
+        Initializes a population of creatures with random genetic parameters.
+
+        Args:
+        - pop_size (int): Number of creatures in the population.
+        - gene_count (int): Number of genes per creature.
+        """
+        self.creatures = [creature.Creature(gene_count=gene_count) for _ in range(pop_size)]
+
+    @staticmethod
+    def get_fitness_map(fits):
+        """
+        Generates a cumulative fitness map based on the fitness values provided.
+
+        Args:
+        - fits (list of float): List of fitness values for the population.
+
+        Returns:
+        - list of float: Cumulative fitness map.
+        """
+        fitmap = []
+        total = 0
+        for f in fits:
+            total = total + f
+            fitmap.append(total)
+        return fitmap
+    
+    @staticmethod
+    def select_parent(fitmap):
+        """
+        Selects a parent index based on the cumulative fitness map using stochastic universal sampling (SUS).
+
+        Args:
+        - fitmap (list of float): Cumulative fitness map.
+
+        Returns:
+        - int: Index of the selected parent in the population.
+        """
+        r = np.random.rand()  # Random number between 0 and 1
+        r = r * fitmap[-1]  # Scale r to the total fitness
+        for i in range(len(fitmap)):
+            if r <= fitmap[i]:
+                return i
+
+
+
+
+
+"""
+prepare_shapes.py 
+
+Script to generate a 3D model of a pyramid shape using a combination of Gaussian function for the top surface,
+Perlin noise for surface variation, and embedded cubes to simulate a rocky mountain effect. The script writes the
+generated shape to an OBJ file, including vertices and faces.
+
+Functions:
+- gaussian2(x, y, sigma, height): Computes the height of a point using a Gaussian function.
+- generate_gaussian_pyramid4(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.5, noise_factor=1.0):
+  Generates a pyramid shape with a flat base using Gaussian and Perlin noise.
+- make_pyramid(filename): Generates a tetrahedron (pyramid) shape and writes it to an OBJ file.
+- make_rocky_mountain(filename): Generates a rocky mountain shape with embedded cubes and writes it to an OBJ file.
+- write_to_obj(filename, vertices, indices): Writes vertices and indices to an OBJ file.
+
+Usage:
+Run generate_gaussian_pyramid4("./shapes/gaussian_pyramid.obj") to create the OBJ file for the generated pyramid shape.
+"""
+
+import random
+import math
+from noise import pnoise2
+
+def write_to_obj(filename, vertices, indices):
+    """
+    Write vertices and indices to an OBJ file.
+
+    Parameters:
+    - filename: Name of the OBJ file to write to.
+    - vertices: List of vertex coordinates.
+    - indices: List of vertex indices for defining faces.
+    """
+    with open(filename, 'w') as f:
+        # Write vertices to the file
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+
+        # Write faces to the file
+        for face in indices:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+def make_pyramid(filename):
+    """
+    Generate a pyramid (tetrahedron) and write it to an OBJ file.
+
+    Parameters:
+    - filename: Name of the OBJ file to write to.
+    """
+    # Define the tetrahedron vertices and indices
+    vertices = [
+        [-5, -5, 0],  # Base vertex 1
+        [5, -5, 0],   # Base vertex 2
+        [0, 5, 0],    # Base vertex 3
+        [0, 0, 5]     # Apex vertex
+    ]
+    indices = [
+        [0, 1, 2],  # Base triangle
+        [0, 1, 3],  # Side triangle 1
+        [1, 2, 3],  # Side triangle 2
+        [2, 0, 3]   # Side triangle 3
+    ]
+    # Write the tetrahedron to an OBJ file
+    write_to_obj(filename, vertices, indices)
+
+def make_rocky_mountain(filename):
+    """
+    Generate a rocky mountain shape with embedded cubes and write it to an OBJ file.
+
+    Parameters:
+    - filename: Name of the OBJ file to write to.
+    """
+    # Define the pyramid vertices and indices
+    vertices = [
+        [-5, -5, 0],  # Base vertex 1
+        [5, -5, 0],   # Base vertex 2
+        [5, 5, 0],    # Base vertex 3
+        [-5, 5, 0],   # Base vertex 4
+        [0, 0, 5]     # Apex vertex
+    ]
+    indices = [
+        [0, 1, 4],  # Side triangle 1
+        [1, 2, 4],  # Side triangle 2
+        [2, 3, 4],  # Side triangle 3
+        [3, 0, 4],  # Side triangle 4
+        [0, 1, 2],  # Base triangle 1
+        [2, 3, 0]   # Base triangle 2
+    ]
+
+    # Add random cubes embedded in the pyramid
+    num_cubes = 5
+    for _ in range(num_cubes):
+        size = random.uniform(0.5, 2)
+        x = random.uniform(-4, 4)
+        y = random.uniform(-4, 4)
+        z = random.uniform(0.5, 4.5)
+        
+        # Define cube vertices
+        cube_vertices = [
+            [x-size/2, y-size/2, z-size/2],
+            [x+size/2, y-size/2, z-size/2],
+            [x+size/2, y+size/2, z-size/2],
+            [x-size/2, y+size/2, z-size/2],
+            [x-size/2, y-size/2, z+size/2],
+            [x+size/2, y-size/2, z+size/2],
+            [x+size/2, y+size/2, z+size/2],
+            [x-size/2, y+size/2, z+size/2]
+        ]
+        
+        # Define cube faces
+        cube_indices = [
+            [0, 1, 2], [2, 3, 0],  # Bottom
+            [4, 5, 6], [6, 7, 4],  # Top
+            [0, 1, 5], [5, 4, 0],  # Front
+            [1, 2, 6], [6, 5, 1],  # Right
+            [2, 3, 7], [7, 6, 2],  # Back
+            [3, 0, 4], [4, 7, 3]   # Left
+        ]
+        
+        # Offset cube indices by the current number of vertices
+        offset = len(vertices)
+        cube_indices = [[i+offset for i in face] for face in cube_indices]
+        
+        # Add cube vertices and indices to the main lists
+        vertices.extend(cube_vertices)
+        indices.extend(cube_indices)
+
+    # Write the combined vertices and indices to an OBJ file
+    write_to_obj(filename, vertices, indices)
+
+#MyCode
+
+# Function to generate a varied landscape with hills and valleys
+def generate_landscape(filename, size=10, resolution=0.5, height_range=(3, 7), sigma_range=(2, 5)):
+    """
+    Generates a landscape with hills and valleys using a Gaussian distribution.
+    
+    """
+    vertices = []
+    faces = []
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            height = random.uniform(*height_range)
+            sigma = random.uniform(*sigma_range)
+            z = height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+            vertices.append([x, y, z])
+            if i > 0 and j > 0:
+                # Add two faces (triangles) to form a square
+                idx = i * int(size / resolution) + j
+                faces.append([idx, idx - 1, idx - int(size / resolution)])
+                faces.append([idx - 1, idx - int(size / resolution) - 1, idx - int(size / resolution)])
+    write_to_obj(filename, vertices, faces)
+
+# Function to generate a noisy landscape using Perlin noise
+def generate_noisy_landscape(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.1, noise_factor=0.5):
+    """
+    Generates a noisy landscape using Gaussian height and Perlin noise.
+    """
+    vertices = []
+    faces = []
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian(x, y, sigma) * height
+            z += pnoise2(x * noise_scale, y * noise_scale) * noise_factor
+            vertices.append([x, y, z])
+            if i > 0 and j > 0:
+                # Add two faces (triangles) to form a square
+                idx = i * int(size / resolution) + j
+                faces.append([idx, idx - 1, idx - int(size / resolution)])
+                faces.append([idx - 1, idx - int(size / resolution) - 1, idx - int(size / resolution)])
+    write_to_obj(filename, vertices, faces)
+
+
+# Function to determine if a point is outside the pyramid's base
+def outside_pyramid(i, j, pyramid_size, resolution):
+    """
+    Determines if a point (i, j) is outside the base of a pyramid.
+    """
+    x = -pyramid_size/2 + i * resolution
+    y = -pyramid_size/2 + j * resolution
+    return abs(x) > pyramid_size/2 or abs(y) > pyramid_size/2
+
+
+# Function to combine a pyramid shape with surrounding terrain
+def combine_shapes(filename, pyramid_size=5, terrain_size=10, resolution=0.5):
+    """
+    Combines a central pyramid shape with surrounding terrain.
+    """
+    vertices = []
+    faces = []
+
+    # Generate a pyramid at the center
+    vertices.extend([
+        [0, 0, pyramid_size/2],  # peak of the pyramid
+        [-pyramid_size/2, -pyramid_size/2, 0],  # base vertices
+        [pyramid_size/2, -pyramid_size/2, 0],
+        [pyramid_size/2, pyramid_size/2, 0],
+        [-pyramid_size/2, pyramid_size/2, 0]
+    ])
+    faces.extend([
+        [1, 2, 3],
+        [1, 3, 4],
+        [1, 4, 5],
+        [1, 5, 2],
+        [2, 3, 4, 5]  # base of the pyramid
+    ])
+
+    # Generate surrounding terrain vertices and faces
+    for i in range(-terrain_size, terrain_size + 1):
+        for j in range(-terrain_size, terrain_size + 1):
+            if outside_pyramid(i, j, pyramid_size, resolution):  # outside the pyramid
+                vertices.append([i, j, 0])  # all terrain vertices are at z=0
+
+    for i in range(terrain_size * 2):
+        for j in range(terrain_size * 2):
+            if outside_pyramid(i - terrain_size, j - terrain_size, pyramid_size, resolution):  # outside the pyramid
+                idx = len(vertices) - (terrain_size * 2 - i) * (terrain_size * 2) + j
+                faces.append([idx, idx + 1, idx + terrain_size * 2 + 1, idx + terrain_size * 2])
+
+    write_to_obj(filename, vertices, faces)
+
+# Resume old code
+
+def gaussian(x, y, sigma):
+    """
+    Return the height of the shape at position (x, y) using a Gaussian function.
+
+    Returns:
+    - Height value calculated using the Gaussian function.
+    """
+    return math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid(filename, size=10, resolution=0.5, sigma=3):
+    """
+    Generate a pyramid-like shape using a Gaussian function and write it to an OBJ file.
+
+    Output:
+    - Writes the generated shape to an OBJ file with vertices and faces.
+    """
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian(x, y, sigma)
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+import math
+
+def gaussian2(x, y, sigma, height):
+    """
+    Return the height of the shape at position (x, y) using a Gaussian function.
+
+    Returns:
+    - Height value calculated using the Gaussian function.
+    """
+    return height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid2(filename, size=10, resolution=0.5, sigma=3, height=5):
+    """
+    Generate a pyramid shape with a flat base using a Gaussian function and write it to an OBJ file.
+
+    Output:
+    - Writes the generated shape to an OBJ file with vertices and faces.
+    """
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+            vertices.append([x, y, z])
+
+    # Generate vertices for the flat base
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square on the pyramid
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square on the pyramid
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+            # Calculate indices for the current square on the base
+            base_offset = int(size / resolution) * int(size / resolution)
+            bottom_left_base = base_offset + bottom_left
+            bottom_right_base = base_offset + bottom_right
+            top_left_base = base_offset + top_left
+            top_right_base = base_offset + top_right
+
+            # Create two triangles for the current square on the base
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+import math 
+
+def gaussian2(x, y, sigma, height):
+    """
+    Return the height of the shape at position (x, y) using a Gaussian function.
+
+    Returns:
+    - Height value calculated using the Gaussian function.
+    """
+    return height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid3(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.5, noise_factor=1.0):
+    """
+    Generate a pyramid shape with a flat base using a Gaussian function and Perlin noise,
+    and write it to an OBJ file.
+
+    Output:
+    - Writes the generated shape to an OBJ file with vertices and faces.
+    """
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+
+            # Add Perlin noise to the z-coordinate
+            z += pnoise2(x * noise_scale, y * noise_scale) * noise_factor
+
+            vertices.append([x, y, z])
+
+    # Generate vertices for the flat base
+    base_offset = len(vertices)  # Starting index for the base vertices
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces by connecting vertices
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            # Calculate indices for the current square on the pyramid
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            # Create two triangles for the current square on the pyramid
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+            # Calculate indices for the current square on the base
+            bottom_left_base = base_offset + bottom_left
+            bottom_right_base = base_offset + bottom_right
+            top_left_base = base_offset + top_left
+            top_right_base = base_offset + top_right
+
+            # Create two triangles for the current square on the base
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+import math 
+
+def gaussian2(x, y, sigma, height):
+    """
+    Return the height of the shape at position (x, y) using a Gaussian function.
+
+    Returns:
+    - Height value calculated using the Gaussian function.
+    """
+    return height * math.exp(-((x**2 + y**2) / (2 * sigma**2)))
+
+def generate_gaussian_pyramid4(filename, size=10, resolution=0.5, sigma=3, height=5, noise_scale=0.5, noise_factor=1.0):
+    """
+    Generate a pyramid shape with a flat base using a Gaussian function for the top surface,
+    Perlin noise for surface variation, and write it to an OBJ file.
+
+    Output:
+    - Writes the generated shape to an OBJ file with vertices and faces.
+    """
+    vertices = []
+    faces = []
+
+    # Generate vertices using the Gaussian function for the top surface of the pyramid
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = gaussian2(x, y, sigma, height)
+
+            # Add Perlin noise to the z-coordinate
+            z += pnoise2(x * noise_scale, y * noise_scale) * noise_factor
+
+            vertices.append([x, y, z])
+
+    # Generate vertices for the bottom surface (flat base) of the pyramid
+    base_offset = len(vertices)  # Starting index for the base vertices
+    for i in range(int(size / resolution)):
+        for j in range(int(size / resolution)):
+            x = -size/2 + i * resolution
+            y = -size/2 + j * resolution
+            z = 0
+            vertices.append([x, y, z])
+
+    # Generate faces for the top surface
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            bottom_left = i * int(size / resolution) + j
+            bottom_right = i * int(size / resolution) + j + 1
+            top_left = (i + 1) * int(size / resolution) + j
+            top_right = (i + 1) * int(size / resolution) + j + 1
+
+            faces.append([bottom_left, bottom_right, top_left])
+            faces.append([top_left, bottom_right, top_right])
+
+    # Generate faces for the bottom surface
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution) - 1):
+            bottom_left_base = base_offset + i * int(size / resolution) + j
+            bottom_right_base = base_offset + i * int(size / resolution) + j + 1
+            top_left_base = base_offset + (i + 1) * int(size / resolution) + j
+            top_right_base = base_offset + (i + 1) * int(size / resolution) + j + 1
+
+            faces.append([bottom_left_base, top_left_base, bottom_right_base])
+            faces.append([top_left_base, top_right_base, bottom_right_base])
+
+    # Generate faces for the sides
+    for i in range(int(size / resolution) - 1):
+        for j in range(int(size / resolution)):
+            top = i * int(size / resolution) + j
+            bottom = base_offset + i * int(size / resolution) + j
+            top_next = (i + 1) * int(size / resolution) + j
+            bottom_next = base_offset + (i + 1) * int(size / resolution) + j
+
+            faces.append([top, bottom, top_next])
+            faces.append([top_next, bottom, bottom_next])
+
+    # Write to OBJ file
+    with open(filename, 'w') as f:
+        for vertex in vertices:
+            f.write(f"v {vertex[0]} {vertex[1]} {vertex[2]}\n")
+        for face in faces:
+            f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+# Codes were commented out to test new functions. 
+
+# Generate the OBJ file
+generate_gaussian_pyramid4("./shapes/gaussian_pyramid.obj")
+
+# Generate the OBJ file
+generate_gaussian_pyramid3("./shapes/gaussian_pyramid.obj")
+
+
+# Generate the OBJ file
+generate_gaussian_pyramid("./shapes/gaussian_pyramid.obj")
+
+
+# make_pyramid('./shapes/pyramid.obj')
+make_rocky_mountain('./shapes/mountain_with_cubes.obj')
+
+# make_pyramid('mountain.obj')
+make_rocky_mountain('./shapes/mountain_with_cubes.obj')
+
+# Generate a landscape with a height range of 2 to 6 and sigma range of 3 to 7
+generate_landscape("./shapes/landscape1.obj", height_range=(2, 6), sigma_range=(3, 7))
+
+# Generate a noisy landscape with a larger noise factor
+generate_noisy_landscape("./shapes/noisy_landscape1.obj", noise_factor=0.7)
+
+# Generate a combined shape with a larger pyramid and terrain size
+combine_shapes("./shapes/combined_shapes1.obj", pyramid_size=7, terrain_size=15)
+
+# Generate a landscape with a smaller resolution
+generate_landscape("./shapes/landscape2.obj", resolution=0.3)
+
+# Generate a noisy landscape with a smaller noise scale
+generate_noisy_landscape("./shapes/noisy_landscape2.obj", noise_scale=0.05)
+
+# Generate a combined shape with a smaller resolution
+combine_shapes("./shapes/combined_shapes2.obj", resolution=0.3)
+
+
+
+
+"""
+realtime_from_csv.py
+
+This script uses PyBullet to simulate the movement of a creature based on genetic data loaded from a CSV file. 
+The creature's genetic makeup is represented using a genome, and its movement is controlled by joint velocities 
+derived from genetic parameters. The simulation tracks the creature's movement over a specified time period, 
+outputting the distance moved and total distance at the end. To provide a valid CSV file containing genetic 
+data as a command-line argument when running the script.
+"""
+
+import os 
+import genome
+import sys
+import creature
+import pybullet as p
+import time 
+import random
+import numpy as np
+
+## ... usual starter code to create a sim and floor
+def main(csv_file):
+    assert os.path.exists(csv_file), "Tried to load " + csv_file + " but it does not exists"
+
+    # Connect to the PyBullet GUI and configure simulation parameters
+    p.connect(p.GUI)
+    p.setPhysicsEngineParameter(enableFileCaching=0)
+    p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+
+    # Create a ground plane
+    plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+    floor = p.createMultiBody(plane_shape, plane_shape)
+    p.setGravity(0, 0, -10)
+    
+    # Generate a random creature and load genetic data
+    cr = creature.Creature(gene_count=1)
+    dna = genome.Genome.from_csv(csv_file)
+    cr.update_dna(dna)
+    
+    # Save creature's XML representation to a file
+    with open('test.urdf', 'w') as f:
+        f.write(cr.to_xml())
+    
+    # Load creature into the simulation
+    rob1 = p.loadURDF('test.urdf')
+    
+    # Position the creature above the ground plane
+    p.resetBasePositionAndOrientation(rob1, [0, 0, 2.5], [0, 0, 0, 1])
+    start_pos, orn = p.getBasePositionAndOrientation(rob1)
+
+    # Simulation parameters
+    elapsed_time = 0
+    wait_time = 1.0 / 240  # seconds (simulation step time)
+    total_time = 30  # seconds (total simulation time)
+    step = 0
+
+    # Simulation loop
+    while True:
+        p.stepSimulation()
+        step += 1
+        
+        # Control joints every 1/10 seconds (24 steps)
+        if step % 24 == 0:
+            motors = cr.get_motors()
+            assert len(motors) == p.getNumJoints(rob1), "Mismatch in number of joints"
+            
+            # Set joint velocities based on motor outputs
+            for jid in range(p.getNumJoints(rob1)):
+                mode = p.VELOCITY_CONTROL
+                vel = motors[jid].get_output()
+                p.setJointMotorControl2(rob1, jid, controlMode=mode, targetVelocity=vel)
+            
+            # Measure current position and calculate distance moved
+            new_pos, orn = p.getBasePositionAndOrientation(rob1)
+            dist_moved = np.linalg.norm(np.asarray(start_pos) - np.asarray(new_pos))
+            print("Distance moved:", dist_moved)
+        
+        # Control simulation rate and elapsed time
+        time.sleep(wait_time)
+        elapsed_time += wait_time
+        
+        # End simulation after specified total time
+        if elapsed_time > total_time:
+            break
+    
+    # Print total distance moved by the creature
+    print("TOTAL DISTANCE MOVED:", dist_moved)
+
+if __name__ == "__main__":
+    assert len(sys.argv) == 2, "Usage: python playback_test.py csv_filename"
+    main(sys.argv[1])
+
+
+
+
+"""
+simulation.py
+
+"""
+
+import pybullet as p
+from multiprocessing import Pool
+
+class Simulation:
+    def __init__(self, sim_id=0):
+        """
+        Initialize a simulation environment in PyBullet.
+
+        Args:
+        - sim_id (int): Simulation identifier.
+
+        Initializes PyBullet in direct mode for physics simulation.
+        """
+        self.physicsClientId = p.connect(p.DIRECT)  # Connect to PyBullet in direct mode
+        self.sim_id = sim_id  # Simulation ID
+
+    def run_creature(self, cr, iterations=2400):
+        """
+        Run a creature simulation in PyBullet.
+
+        Args:
+        - cr (Creature): Creature object to simulate.
+        - iterations (int): Number of simulation steps.
+
+        Resets the simulation, loads the creature, and runs it for specified iterations.
+        """
+        pid = self.physicsClientId
+        p.resetSimulation(physicsClientId=pid)  # Reset simulation
+        p.setPhysicsEngineParameter(enableFileCaching=0, physicsClientId=pid)  # Configure physics parameters
+
+        p.setGravity(0, 0, -10, physicsClientId=pid)  # Set gravity
+        plane_shape = p.createCollisionShape(p.GEOM_PLANE, physicsClientId=pid)  # Create ground plane
+        floor = p.createMultiBody(plane_shape, plane_shape, physicsClientId=pid)
+
+        # Define the position and orientation of the mountain
+        mountain_position_2 = (10, -10, 1)  # Adjust as needed
+        mountain_orientation = p.getQuaternionFromEuler((0, 0, 0))
+
+        # Set the additional search path for URDF files
+        p.setAdditionalSearchPath('shapes/')
+
+        # Load the URDF file for the mountain using the specified physics client ID
+        landscape = p.loadURDF('mountain.urdf', useFixedBase=True, physicsClientId=pid)
+
+        # Load another URDF file for a mountain with cubes at the specified position and orientation,
+        # using a fixed base
+        mountain = p.loadURDF("mountain_with_cubes.urdf", mountain_position_2, mountain_orientation, useFixedBase=1)
+
+        xml_file = 'temp' + str(self.sim_id) + '.urdf'
+        xml_str = cr.to_xml()
+        with open(xml_file, 'w') as f:
+            f.write(xml_str)
+        
+        cid = p.loadURDF(xml_file, physicsClientId=pid)  # Load creature URDF
+        p.resetBasePositionAndOrientation(cid, [0, 0, 2.5], [0, 0, 0, 1], physicsClientId=pid)  # Position creature
+
+        for step in range(iterations):
+            p.stepSimulation(physicsClientId=pid)  # Step simulation
+            if step % 24 == 0:
+                self.update_motors(cid=cid, cr=cr)  # Update motors periodically
+
+            pos, orn = p.getBasePositionAndOrientation(cid, physicsClientId=pid)
+            cr.update_position(pos)  # Update creature's position
+
+    def update_motors(self, cid, cr):
+        """
+        Update motors of the creature in the simulation.
+
+        Args:
+        - cid (int): Creature ID in the physics engine.
+        - cr (Creature): Creature object with motor controls.
+
+        Updates joint motor controls based on the creature's motor outputs.
+        """
+        for jid in range(p.getNumJoints(cid, physicsClientId=self.physicsClientId)):
+            m = cr.get_motors()[jid]
+
+            p.setJointMotorControl2(cid, jid,
+                                    controlMode=p.VELOCITY_CONTROL,
+                                    targetVelocity=m.get_output(),
+                                    force=5,
+                                    physicsClientId=self.physicsClientId)
+        
+    # Evaluate the population of creatures over a specified number of iterations.
+    def eval_population(self, pop, iterations):
+        for cr in pop.creatures:
+            self.run_creature(cr, 2400) 
+
+class ThreadedSim():
+    def __init__(self, pool_size):
+        """
+        Initialize a pool of simulations for multi-threaded evaluation.
+
+        Creates a list of Simulation instances to handle concurrent simulations.
+        """
+        self.sims = [Simulation(i) for i in range(pool_size)]
+
+    @staticmethod
+    def static_run_creature(sim, cr, iterations):
+        """
+        Static method to run a creature simulation in a specific simulation instance.
+
+        Runs a creature simulation in a specified Simulation instance.
+        """
+        sim.run_creature(cr, iterations)
+        return cr
+    
+    def eval_population(self, pop, iterations):
+        """
+        Evaluate a population of creatures across multiple simulations.
+
+        Distributes the evaluation of creatures in the population across multiple simulations.
+        """
+        pool_args = []
+        start_ind = 0
+        pool_size = len(self.sims)
+        
+        while start_ind < len(pop.creatures):
+            this_pool_args = []
+            for i in range(start_ind, start_ind + pool_size):
+                if i == len(pop.creatures):  # Check end of population
+                    break
+                sim_ind = i % len(self.sims)  # Determine simulation index
+                this_pool_args.append([self.sims[sim_ind], pop.creatures[i], iterations])
+            pool_args.append(this_pool_args)
+            start_ind = start_ind + pool_size
+        
+        new_creatures = []
+        for pool_argset in pool_args:
+            with Pool(pool_size) as p:
+                creatures = p.starmap(ThreadedSim.static_run_creature, pool_argset)
+                new_creatures.extend(creatures)  # Collect results from simulations
+        
+        pop.creatures = new_creatures  # Update population with evaluated creatures
+
+
+
+
+
+"""
+starter.py
+"""
+
+import pybullet as p
+import pybullet_data as pd
+
+# Connect to PyBullet GUI
+p.connect(p.GUI)
+
+# Set physics engine parameters
+p.setPhysicsEngineParameter(enableFileCaching=0)
+
+# Configure debug visualizer
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+
+# Create ground plane
+plane_shape = p.createCollisionShape(p.GEOM_PLANE)
+floor = p.createMultiBody(plane_shape, plane_shape)
+
+# Set gravity
+p.setGravity(0, 0, -10)
+
+
+
+
+
+"""
+
+test_creature.py 
+
+Testing functionality of Creature and Motor classes. 
+A series of unit tests using the unittest framework to validate the functionality of the Creature and 
+Motor classes within the creature module, assuming their existence.
+
+These tests ensure that the Creature and Motor classes perform as expected in various scenarios, 
+verifying their correctness and reliability.
+"""
+import unittest
+import creature  # Assuming this is a module containing Creature and Motor classes
+import pybullet as p
+
+class TestCreature(unittest.TestCase):
+    """
+    Test cases for the Creature and Motor classes.
+    """
+
+    def testCreatExists(self):
+        """
+        Test if the Creature class exists.
+        """
+        self.assertIsNotNone(creature.Creature)
+
+    def testCreatureGetFlatLinks(self):
+        """
+        Test the get_flat_links method of Creature.
+        """
+        c = creature.Creature(gene_count=4)
+        links = c.get_flat_links()
+        self.assertEqual(len(links), 4)
+
+    def testExpLinks(self):
+        """
+        Test the get_expanded_links method of Creature.
+        """
+        c = creature.Creature(gene_count=25)
+        links = c.get_flat_links()
+        exp_links = c.get_expanded_links()
+        self.assertGreaterEqual(len(exp_links), len(links))
+
+    def testToXMLNotNone(self):
+        """
+        Test if the to_xml method of Creature returns a non-None value.
+        """
+        c = creature.Creature(gene_count=2)
+        xml_str = c.to_xml()
+        self.assertIsNotNone(xml_str)
+
+    def testLoadXML(self):
+        """
+        Test loading a URDF file generated by Creature.
+        """
+        c = creature.Creature(gene_count=20)
+        xml_str = c.to_xml()
+        with open('test.urdf', 'w') as f:
+            f.write(xml_str)
+        p.connect(p.DIRECT)
+        cid = p.loadURDF('test.urdf')
+        self.assertIsNotNone(cid)
+
+    def testMotor(self):
+        """
+        Test creation of a Motor object.
+        """
+        m = creature.Motor(0.1, 0.5, 0.5)
+        self.assertIsNotNone(m)
+
+    def testMotorVal(self):
+        """
+        Test the get_output method of Motor when maximum inputs are given.
+        """
+        m = creature.Motor(0.1, 0.5, 0.5)
+        self.assertEqual(m.get_output(), 1)
+
+    def testMotorVal2(self):
+        """
+        Test the get_output method of Motor when input values exceed limits.
+        """
+        m = creature.Motor(0.6, 0.5, 0.5)
+        m.get_output()
+        m.get_output()  # Ensure we call get_output twice to cover behavior
+        self.assertGreater(m.get_output(), 0)
+
+    def testDist(self):
+        """
+        Test the distance calculation in Creature after position updates.
+        """
+        c = creature.Creature(3)
+        c.update_position((0, 0, 0))
+        d1 = c.get_distance_travelled()
+        c.update_position((1, 1, 1))
+        d2 = c.get_distance_travelled()
+        self.assertGreater(d2, d1)
+
+    def get_total_vertical_distance_travelled(self):
+        """
+        Test the vertical distance travelled.
+        """
+        c = creature.Creature(3)
+        c.update_position((0, 0, 0))
+        d1 = c.get_total_vertical_distance_travelled()
+        c.update_position((1, 1, 1))
+        d2 = c.get_total_vertical_distance_travelled()
+        self.assertGreater(d2, d1)
+
+
+# Run all the test cases when the script is executed
+unittest.main()
+
+
+
+
+
+"""
+test_ga_no_thread.py
+
+ This script contains unit tests for a basic Genetic Algorithm (GA) implementation using the unittest framework.
+ It evaluates the evolution of a population of creatures represented by genetic data through simulated environments.
+
+ The purpose of this code is to verify the functionality of the GA process, including fitness evaluation, selection, crossover,
+ mutation, and elitism. The tests assess if the GA correctly evolves creatures over iterations to optimize their performance.
+
+ It is noted that on certain environments (Windows with any Python version, M1 Mac with any Python version, or Intel Mac
+ with Python > 3.7), the multi-threaded version of the simulation does not function correctly. Hence, this version uses
+ a single-threaded Simulation instance instead of the multi-threaded ThreadedSim.
+
+ The TestGA class defines several test cases:
+ - testBasicGA: Implements a basic GA loop where each creature in a population is evaluated using a non-threaded Simulation,
+                followed by selection, crossover, mutation, and elitism steps. Fitness metrics and genetic diversity are printed
+                at each iteration to track progress. The final assertion ensures that the fittest creature's fitness is not zero.
+
+"""
+import unittest
+import population
+import simulation
+import genome
+import creature
+import numpy as np
+import pandas as pd  # Import for CSV handling
+import os  # Import for creating directories
+
+class TestGA(unittest.TestCase):
+    def testBasicGA(self):
+        """
+        Test case for basic Genetic Algorithm (GA) implementation.
+        """
+        pop = population.Population(pop_size=10, gene_count=3)
+        sim = simulation.Simulation()  # Use single-threaded Simulation due to platform-specific limitations
+
+        # Initialize an empty list to store the data for each generation
+        data = []
+
+        ga_generations = 1000  # Define the number of generations
+
+        # Create 'data' directory if it doesn't exist
+        os.makedirs('data', exist_ok=True)
+
+        for iteration in range(ga_generations):
+            # Run the simulation for each creature in the population
+            total_vertical_distances = []
+            total_joins = []
+            for cr in pop.creatures:
+                sim.run_creature(cr, 2400)
+                total_vertical_distances.append(cr.get_total_vertical_distance_travelled())
+                total_joins.append(len(cr.get_expanded_links()))
+            
+            # Collect fitness and genetic information
+            fits = [cr.get_total_vertical_distance_travelled() for cr in pop.creatures]
+            links = [len(cr.get_expanded_links()) for cr in pop.creatures]
+            
+            # Print metrics for monitoring progress
+            print(iteration, "fittest:", np.round(np.max(fits), 3),
+                  "mean:", np.round(np.mean(fits), 3), "mean links", np.round(np.mean(links)),
+                  "max links", np.round(np.max(links)), "mean joins:", np.round(np.mean(total_joins)),
+                  "max joins:", np.round(np.max(total_joins)), "max vertical distance:",
+                  np.round(np.max(total_vertical_distances), 3), "mean vertical distance:",
+                  np.round(np.mean(total_vertical_distances), 3))
+            
+            # Store the data for this generation in a dictionary
+            generation_data = {
+                "iteration": iteration,
+                "fittest": np.round(np.max(fits), 3),
+                "mean": np.round(np.mean(fits), 3),
+                "mean links": np.round(np.mean(links)),
+                "max links": np.round(np.max(links)),
+                "mean joins": np.round(np.mean(total_joins)),
+                "max joins": np.round(np.max(total_joins)),
+                "max vertical distance": np.round(np.max(total_vertical_distances), 3),
+                "mean vertical distance": np.round(np.mean(total_vertical_distances), 3),
+            }
+    
+            # Add the dictionary to the list
+            data.append(generation_data)
+
+            # Create a fitness map and evolve the population
+            fit_map = population.Population.get_fitness_map(fits)
+            new_creatures = []
+
+            for i in range(len(pop.creatures)):
+                p1_ind = population.Population.select_parent(fit_map)
+                p2_ind = population.Population.select_parent(fit_map)
+                p1 = pop.creatures[p1_ind]
+                p2 = pop.creatures[p2_ind]
+
+                # Perform genetic operations
+                dna = genome.Genome.crossover(p1.dna, p2.dna)
+                dna = genome.Genome.point_mutate(dna, rate=0.1, amount=0.25)
+                dna = genome.Genome.shrink_mutate(dna, rate=0.25)
+                dna = genome.Genome.grow_mutate(dna, rate=0.1)
+
+                # Create a new creature and add to the new population
+                cr = creature.Creature(1)
+                cr.update_dna(dna)
+                new_creatures.append(cr)
+
+            # Elitism: Preserve the top performer from the previous generation
+            max_fit = np.max(fits)
+            for cr in pop.creatures:
+                if cr.get_total_vertical_distance_travelled() == max_fit:
+                    new_cr = creature.Creature(1)
+                    new_cr.update_dna(cr.dna)
+                    new_creatures[0] = new_cr
+                    if iteration % 10 == 0:  # Save every 10th generation
+                        filename = os.path.join("data", f"elite_{iteration}.csv")
+                        genome.Genome.to_csv(cr.dna, filename)
+                    break
+
+            # Update the population with new creatures
+            pop.creatures = new_creatures
+
+        # Convert the list of dictionaries to a DataFrame
+        df = pd.DataFrame(data)
+
+        # Save the DataFrame to a CSV file
+        df.to_csv("ga_output.csv", index=False)
+
+        # Assertion: Ensure that the fittest creature's fitness is not zero
+        self.assertNotEqual(fits[0], 0)
+
+# Run all the test cases when the script is executed
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+
+
+"""
+
+test_ga.py 
+
+This script contains unit tests for a basic Genetic Algorithm (GA) implementation using the unittest framework.
+It evaluates the evolution of a population of creatures represented by genetic data through simulated environments.
+
+The purpose of this code is to verify the functionality of the GA process, including fitness evaluation, selection, crossover,
+mutation, and elitism. The tests assess if the GA correctly evolves creatures over iterations to optimize their performance.
+ 
+It is noted that on certain environments (Windows with any Python version, M1 Mac with any Python version, or Intel Mac
+with Python > 3.7), the multi-threaded version of the simulation does not function correctly. Hence, this version uses
+a single-threaded ThreadedSim instance instead of the multi-threaded Simulation, as specified in the comments.
+
+The TestGA class defines a single test case:
+- testBasicGA: Implements a basic GA loop where each creature in a population is evaluated using a multi-threaded Simulation,
+               followed by selection, crossover, mutation, and elitism steps. Fitness metrics and genetic diversity are printed
+               at each iteration to track progress. The final assertion ensures that the fittest creature's fitness is not zero.
+
+"""
+
+import unittest
+import population
+import simulation
+import genome
+import creature
+import numpy as np
+
+class TestGA(unittest.TestCase):
+    def testBasicGA(self):
+        """
+        Test case for basic Genetic Algorithm (GA) implementation.
+        """
+        pop = population.Population(pop_size=10, gene_count=3)
+        sim = simulation.ThreadedSim(pool_size=1)  # Use single-threaded ThreadedSim due to platform-specific limitations
+
+        for iteration in range(1000):
+            # Run the simulation for the entire population
+            sim.eval_population(pop, 2400)
+            
+            # Collect fitness and genetic information
+            fits = [cr.get_distance_travelled() for cr in pop.creatures]
+            links = [len(cr.get_expanded_links()) for cr in pop.creatures]
+            
+            # Print metrics for monitoring progress
+            print(iteration, "fittest:", np.round(np.max(fits), 3),
+                  "mean:", np.round(np.mean(fits), 3), "mean links", np.round(np.mean(links)), "max links", np.round(np.max(links)))
+            
+            # Create a fitness map and evolve the population
+            fit_map = population.Population.get_fitness_map(fits)
+            new_creatures = []
+            
+            # Generate new creatures through selection, crossover, mutation, and elitism
+            for i in range(len(pop.creatures)):
+                p1_ind = population.Population.select_parent(fit_map)
+                p2_ind = population.Population.select_parent(fit_map)
+                p1 = pop.creatures[p1_ind]
+                p2 = pop.creatures[p2_ind]
+                
+                # Perform genetic operations
+                dna = genome.Genome.crossover(p1.dna, p2.dna)
+                dna = genome.Genome.point_mutate(dna, rate=0.1, amount=0.25)
+                dna = genome.Genome.shrink_mutate(dna, rate=0.25)
+                dna = genome.Genome.grow_mutate(dna, rate=0.1)
+                
+                # Create a new creature and add to the new population
+                cr = creature.Creature(1)
+                cr.update_dna(dna)
+                new_creatures.append(cr)
+            
+            # Elitism: Preserve the top performer from the previous generation
+            max_fit = np.max(fits)
+            for cr in pop.creatures:
+                if cr.get_distance_travelled() == max_fit:
+                    new_cr = creature.Creature(1)
+                    new_cr.update_dna(cr.dna)
+                    new_creatures[0] = new_cr
+                    filename = "elite_"+str(iteration)+".csv"
+                    genome.Genome.to_csv(cr.dna, filename)
+                    break
+            
+            # Update the population with new creatures
+            pop.creatures = new_creatures
+        
+        # Assertion: Ensure that the fittest creature's fitness is not zero
+        self.assertNotEqual(fits[0], 0)
+    
+    def testGASettings(self):
+        """
+        Test different Genetic Algorithm settings to observe their impact on parent selection.
+        """
+        # Define different population sizes, mutation rates, and crossover rates to test
+        population_sizes = [10, 20, 50]
+        mutation_rates = [0.01, 0.05, 0.1]
+        crossover_rates = [0.6, 0.7, 0.8]
+
+        # Iterate over different settings
+        for pop_size in population_sizes:
+            for mutation_rate in mutation_rates:
+                for crossover_rate in crossover_rates:
+                    # Initialize a population with these settings
+                    pop = population.Population(pop_size=pop_size, gene_count=3)
+                    sim = simulation.ThreadedSim(pool_size=1)
+
+                    for iteration in range(100):
+                        # Run the simulation for the entire population
+                        sim.eval_population(pop, 2400)
+
+                        # Collect fitness and genetic information
+                        fits = [cr.get_distance_travelled() for cr in pop.creatures]
+                        links = [len(cr.get_expanded_links()) for cr in pop.creatures]
+
+                        # Print metrics for monitoring progress
+                        print(f"Pop Size: {pop_size}, Mutation Rate: {mutation_rate}, Crossover Rate: {crossover_rate}, Iteration: {iteration}, Fittest: {np.round(np.max(fits), 3)}, Mean: {np.round(np.mean(fits), 3)}, Mean Links: {np.round(np.mean(links), 3)}, Max Links: {np.round(np.max(links), 3)}")
+
+                        # Create a fitness map and evolve the population
+                        fit_map = population.Population.get_fitness_map(fits)
+                        new_creatures = []
+
+                        # Generate new creatures through selection, crossover, mutation, and elitism
+                        for i in range(len(pop.creatures)):
+                            p1_ind = population.Population.select_parent(fit_map)
+                            p2_ind = population.Population.select_parent(fit_map)
+                            p1 = pop.creatures[p1_ind]
+                            p2 = pop.creatures[p2_ind]
+
+                            # Perform genetic operations
+                            dna = genome.Genome.crossover(p1.dna, p2.dna)
+                            dna = genome.Genome.point_mutate(dna, rate=mutation_rate, amount=0.25)
+                            dna = genome.Genome.shrink_mutate(dna, rate=0.25)
+                            dna = genome.Genome.grow_mutate(dna, rate=mutation_rate)
+
+                            # Create a new creature and add to the new population
+                            cr = creature.Creature(1)
+                            cr.update_dna(dna)
+                            new_creatures.append(cr)
+
+                        # Elitism: Preserve the top performer from the previous generation
+                        max_fit = np.max(fits)
+                        for cr in pop.creatures:
+                            if cr.get_distance_travelled() == max_fit:
+                                new_cr = creature.Creature(1)
+                                new_cr.update_dna(cr.dna)
+                                new_creatures[0] = new_cr
+                                break
+
+                        # Update the population with new creatures
+                        pop.creatures = new_creatures
+        
+        # Assertion: Ensure that the fittest creature's fitness is not zero
+        self.assertNotEqual(fits[0], 0)
+
+# Run all the test cases when the script is executed
+if __name__ == '__main__':
+    unittest.main()
+
+
+
+
+
+"""
+
+test_genome.py 
+
+ This script contains unit tests for the genome module using the unittest framework.
+ It verifies various functionalities and methods of the Genome class, ensuring that they
+ behave correctly under different conditions. 
+ 
+ The purpose of these tests is to validate the reliability and correctness of 
+ the genome operations implemented in the module.
+ 
+"""
+
+# Import necessary libraries and modules
+import unittest 
+import genome
+import numpy as np
+import os
+
+# Define a test case class inheriting from unittest.TestCase
+class GenomeTest(unittest.TestCase):
+
+    def testClassExists(self):
+        """
+        Test if the Genome class exists.
+        """
+        self.assertIsNotNone(genome.Genome)
+
+    def testRandomGene(self):
+        """
+        Test the existence of the method to generate random genes.
+        """
+        self.assertIsNotNone(genome.Genome.get_random_gene)
+
+    def testRandomGeneNotNone(self):
+        """
+        Test that the generated random genes are not None.
+        """
+        self.assertIsNotNone(genome.Genome.get_random_gene(5))
+
+    def testRandomGeneHasValues(self):
+        """
+        Test that random genes contain values.
+        """
+        gene = genome.Genome.get_random_gene(5)
+        self.assertIsNotNone(gene[0])
+
+    def testRandomGeneLength(self):
+        """
+        Test the length of randomly generated genes.
+        """
+        gene = genome.Genome.get_random_gene(20)
+        self.assertEqual(len(gene), 20)
+
+    def testRandGeneIsNumpyArrays(self):
+        """
+        Test that randomly generated genes are numpy arrays.
+        """
+        gene = genome.Genome.get_random_gene(20)
+        self.assertEqual(type(gene), np.ndarray)
+
+    def testRandomGenomeExists(self):
+        """
+        Test the existence of a randomly generated genome.
+        """
+        data = genome.Genome.get_random_genome(20, 5)
+        self.assertIsNotNone(data)
+
+    def testGeneSpecExist(self):
+        """
+        Test if gene specifications exist.
+        """
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec)
+    
+    def testGeneSpecHasLinkLength(self):
+        """
+        Test that gene specifications include 'link-length'.
+        """
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec['link-length'])
+
+    def testGeneSpecHasLinkLengthInd(self):
+        """
+        Test that gene specifications include 'link-length' index.
+        """
+        spec = genome.Genome.get_gene_spec()
+        self.assertIsNotNone(spec['link-length']["ind"])
+
+    def testGeneSpecScale(self):
+        """
+        Test scaling of genes based on gene specifications.
+        """
+        spec = genome.Genome.get_gene_spec()
+        gene = genome.Genome.get_random_gene(20)
+        self.assertGreater(gene[spec["link-length"]["ind"]], 0)
+
+    def testGeneToGeneDict(self):
+        """
+        Test conversion of genes to gene dictionaries.
+        """
+        spec = genome.Genome.get_gene_spec()
+        gene = genome.Genome.get_random_gene(len(spec))
+        gene_dict = genome.Genome.get_gene_dict(gene, spec)
+        self.assertIn("link-recurrence", gene_dict)
+
+    def testGenomeToDict(self):
+        """
+        Test conversion of genomes to dictionaries.
+        """
+        spec = genome.Genome.get_gene_spec()
+        dna = genome.Genome.get_random_genome(len(spec), 3)
+        genome_dicts = genome.Genome.get_genome_dicts(dna, spec)
+        self.assertEqual(len(genome_dicts), 3)
+
+    def testFlatLinks(self):
+        """
+        Test creation and existence of URDFLink objects.
+        """
+        links = [
+          genome.URDFLink(name="A", parent_name=None, recur=1), 
+          genome.URDFLink(name="B", parent_name="A", recur=2), 
+          genome.URDFLink(name="C", parent_name="B", recur=2)
+        ]
+        self.assertIsNotNone(links)
+
+    def testExpandLinks(self):
+        """
+        Test expansion of link objects.
+        """
+        links = [
+            genome.URDFLink(name="A", parent_name="None", recur=1), 
+            genome.URDFLink(name="B", parent_name="A", recur=1), 
+            genome.URDFLink(name="C", parent_name="B", recur=2), 
+            genome.URDFLink(name="D", parent_name="C", recur=1), 
+        ]
+        exp_links = [links[0]]
+        genome.Genome.expandLinks(links[0], links[0].name, links, exp_links)   
+        self.assertEqual(len(exp_links), 6)
+
+    def testCrossover(self):
+        """
+        Test crossover operation between two genes.
+        """
+        g1 = [[1], [2], [3]]
+        g2 = [[4], [5], [6]]
+        for i in range(10):
+            g3 = genome.Genome.crossover(g1, g2)
+            self.assertGreater(len(g3), 0)
+    
+    def test_point(self):
+        """
+        Test point mutation on genes using numpy arrays.
+        """
+        g1 = np.array([[1.0], [2.0], [3.0]])
+        g2 = genome.Genome.point_mutate(g1, rate=1, amount=0.25)
+        self.assertFalse(np.array_equal(g1, g2))
+    
+    def test_point_range(self):
+        """
+        Test mutation range for genes using numpy arrays.
+        """
+        g1 = np.array([[1.0], [0.0], [1.0], [0.0]])
+        for i in range(100):
+            g2 = genome.Genome.point_mutate(g1, rate=1, amount=0.25)
+            self.assertLessEqual(np.max(g2), 1.0)
+            self.assertGreaterEqual(np.min(g2), 0.0)
+    
+    def test_shrink(self):
+        """
+        Test shrink mutation on genes.
+        """
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=1.0)
+        # should def. shrink as rate = 1
+        self.assertEqual(len(g2), 1) 
+
+    def test_shrink2(self):
+        """
+        Test shrink mutation on genes when rate is 0.
+        """
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=0.0)
+        # should not shrink as rate = 0
+        self.assertEqual(len(g2), 2) 
+
+    def test_shrink3(self):
+        """
+        Test no shrink mutation when gene length is 1.
+        """
+        g1 = np.array([[1.0]])
+        g2 = genome.Genome.shrink_mutate(g1, rate=1.0)
+        # should not shrink if already len 1
+        self.assertEqual(len(g2), 1) 
+    
+    def test_grow1(self):
+        """
+        Test growth mutation on genes.
+        """
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.grow_mutate(g1, rate=1)
+        self.assertGreater(len(g2), len(g1))
+
+    def test_grow2(self):
+        """
+        Test no growth mutation on genes when rate is 0.
+        """
+        g1 = np.array([[1.0], [2.0]])
+        g2 = genome.Genome.grow_mutate(g1, rate=0)
+        self.assertEqual(len(g2), len(g1))
+
+    def test_tocsv(self):
+        """
+        Test conversion of genes to CSV format and file creation.
+        """
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        self.assertTrue(os.path.exists('test.csv'))
+
+    def test_tocsv_content(self):
+        """
+        Test correctness of content when genes are converted to CSV format.
+        """
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        expect = "1,2,3,\n"
+        with open('test.csv') as f:
+            csv_str = f.read() 
+        self.assertEqual(csv_str, expect)
+
+    def test_tocsv_content2(self):
+        """
+        Test correctness of content when multiple genes are converted to CSV format.
+        """
+        g1 = [[1,2,3], [4,5,6]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        expect = "1,2,3,\n4,5,6,\n"
+        with open('test.csv') as f:
+            csv_str = f.read() 
+        self.assertEqual(csv_str, expect)
+
+    def test_from_csv(self):
+        """
+        Test reading genes from CSV and ensuring equality with original genes.
+        """
+        g1 = [[1,2,3]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        g2 = genome.Genome.from_csv('test.csv')
+        self.assertTrue(np.array_equal(g1, g2))
+
+    def test_from_csv2(self):
+        """
+        Test reading multiple genes from CSV and ensuring equality with original genes.
+        """
+        g1 = [[1,2,3], [4,5,6]]
+        genome.Genome.to_csv(g1, 'test.csv')
+        g2 = genome.Genome.from_csv('test.csv')
+        self.assertTrue(np.array_equal(g1, g2))
+
+# Run the unit tests if this script is executed directly
+if __name__ == '__main__':
+    unittest.main()
+
+
+
+
+"""
+test_population.py
+"""
+
+# Import necessary libraries and modules
+import unittest
+import population 
+import numpy as np
+
+# Define a test case class inheriting from unittest.TestCase
+class TestPop(unittest.TestCase):
+
+    ## check for a parent id in the range 0-2
+    def testSelPar(self):
+        """
+        Test selection of parent ID within the range of 0 to 2.
+        """
+        fits = [2.5, 1.2, 3.4]
+        fitmap = population.Population.get_fitness_map(fits)
+        pid = population.Population.select_parent(fitmap)
+        self.assertLess(pid, 3)
+
+    ## parent id should be 1 as the first fitness is zero
+    ## second is 1000 and third is 0.1 , so second should 
+    ## almost always be selected
+    def testSelPar2(self):
+        """
+        Test selection of parent ID based on fitness values.
+        """
+        fits = [0, 1000, 0.1]
+        fitmap = population.Population.get_fitness_map(fits)
+        pid = population.Population.select_parent(fitmap)
+        self.assertEqual(pid, 1)    
+
+# Run the unit tests if this script is executed directly
+if __name__ == '__main__':
+    unittest.main()
+
+
+
+
+
+"""
+test_simulation.py
+"""
+
+import unittest
+import simulation
+import creature
+import population
+
+class TestSim(unittest.TestCase):
+    def testSimExists(self):
+        """
+        Test if an instance of Simulation exists.
+        """
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim)
+
+    def testSimId(self):
+        """
+        Test if Simulation has a valid physics client ID.
+        """
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim.physicsClientId)
+
+    def testRun(self):
+        """
+        Test if Simulation has a 'run_creature' method.
+        """
+        sim = simulation.Simulation()
+        self.assertIsNotNone(sim.run_creature)
+
+    def testPos(self):
+        """
+        Test if running a creature updates its position.
+        """
+        sim = simulation.Simulation()
+        cr = creature.Creature(gene_count=3)
+        sim.run_creature(cr)
+        self.assertNotEqual(cr.start_position, cr.last_position)
+    
+    def testPop(self):
+        """
+        Test running simulation for each creature in a population.
+        """
+        pop = population.Population(pop_size=5, gene_count=3)
+        sim = simulation.Simulation()
+        for cr in pop.creatures:
+            sim.run_creature(cr)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        print(dists)
+        self.assertIsNotNone(dists)
+
+    # Uncomment the following method to test multi-threaded simulation
+    
+    # def testProc(self):
+    #     """
+    #     Test evaluation of population using multi-threaded simulation.
+    #     """
+    #     pop = population.Population(pop_size=20, gene_count=3)
+    #     tsim = simulation.ThreadedSim(pool_size=8)
+    #     tsim.eval_population(pop, 2400)
+    #     dists = [cr.get_distance_travelled() for cr in pop.creatures]
+    #     print(dists)
+    #     self.assertIsNotNone(dists)
+
+    def testProcNoThread(self):
+        """
+        Test evaluation of population using single-threaded simulation.
+        """
+        pop = population.Population(pop_size=20, gene_count=3)
+        sim = simulation.Simulation()
+        sim.eval_population(pop, 2400)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        print(dists)
+        self.assertIsNotNone(dists)
+        
+    def testPopSize5(self):
+        """
+        Test simulation with population size 5.
+        """
+        pop_size = 5
+        pop = population.Population(pop_size=pop_size, gene_count=3)
+        sim = simulation.Simulation()
+        for cr in pop.creatures:
+            sim.run_creature(cr)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        self.assertEqual(len(dists), pop_size)
+        self.assertIsNotNone(dists)
+
+    def testPopSize10(self):
+        """
+        Test simulation with population size 10.
+        """
+        pop_size = 10
+        pop = population.Population(pop_size=pop_size, gene_count=3)
+        sim = simulation.Simulation()
+        for cr in pop.creatures:
+            sim.run_creature(cr)
+        dists = [cr.get_distance_travelled() for cr in pop.creatures]
+        self.assertEqual(len(dists), pop_size)
+        self.assertIsNotNone(dists)
+
+    def TestVerticalDistance (self):
+        """
+        Test vertical Distance.
+        """
+        sim = simulation.Simulation()
+        cr = creature.Creature(gene_count = 3)
+        sim.run_creature(cr)
+        self.assertNotEqual(cr.start_position[2], cr.last_position[2])
+
+unittest.main()
+
+
+
+
+
+import pandas as pd
+import glob
+import matplotlib.pyplot as plt
+import os
+
+data_folder = 'data'  # Folder where elite.csv files are stored
+
+# Check if ga_output.csv exists
+if not os.path.exists('ga_output.csv'):
+    # If it doesn't exist, create a DataFrame with the necessary columns
+    df = pd.DataFrame(columns=["iteration", "fittest", "mean"])
+    # Save the DataFrame to ga_output.csv
+    df.to_csv('ga_output.csv', index=False)
+
+# Create an empty DataFrame to store all data
+all_data = pd.DataFrame()
+
+# Loop over all CSV files, sorted in ascending order by filename
+for csv_file in sorted(glob.glob(os.path.join(data_folder, '*.csv'))):
+    if csv_file == 'ga_output.csv':
+        continue  # Ignore ga_output.csv file
+
+    # Read the CSV file, skipping any whitespace after the comma delimiter
+    df = pd.read_csv(csv_file, header=None, skipinitialspace=True)
+    df = df.iloc[:, :-1]  # Drop the last column
+
+    # Convert all values to numeric, replacing any non-numeric values with NaN
+    df = df.apply(pd.to_numeric, errors='coerce')
+
+    # Calculate some statistics
+    fitness = df.sum(axis=1).mean()   
+    num_links = df.count(axis=1).mean()  
+    vertical_distance = df[0].sum()   
+
+    # Add the statistics to the DataFrame
+    all_data = pd.concat([all_data, pd.DataFrame([{
+        'file': csv_file,
+        'fitness': fitness,
+        'num_links': num_links,
+        'vertical_distance': vertical_distance
+    }])], ignore_index=True)
+
+# Save the DataFrame to a new CSV file
+all_data.to_csv('summary.csv', index=False)
+
+# Load the data from ga_output.csv
+df_ga_output = pd.read_csv("ga_output.csv")
+
+# Create a new figure for the first graph
+plt.figure()
+
+# Plot the maximum fitness at each iteration
+plt.plot(df_ga_output["iteration"], df_ga_output["fittest"], label="Max Fitness")
+
+# Plot the average fitness at each iteration
+plt.plot(df_ga_output["iteration"], df_ga_output["mean"], label="Average Fitness")
+
+# Plot the vertical distance at each generation
+plt.plot(all_data.index, all_data['vertical_distance'], label="Vertical Distance")
+
+# Add a legend
+plt.legend()
+
+# Add labels for the x and y axes
+plt.xlabel("Generation")
+plt.ylabel("Fitness")
+
+# Create a new figure for the second graph
+plt.figure(figsize=(10, 6))
+plt.xlabel('Index')  # X-axis label
+plt.ylabel('Value')  # Y-axis label
+plt.title('Metrics Over Time For Each CSV file')  # Graph title
+
+# Plot the fitness, number of links, and vertical distance
+plt.plot(all_data['fitness'], label='Fitness')
+plt.plot(all_data['num_links'], label='Number of Links')
+plt.plot(all_data['vertical_distance'], label='Vertical Distance')
+
+# Add a legend
+plt.legend()
+
+# Show the plot
+plt.show()
+
+
+
+import pandas as pd
+
+df = pd.read_csv('summary.csv')
+
+# Sort the DataFrame
+df_sorted = df.sort_values('vertical_distance', ascending=False)
+
+# Calculate the correlation
+correlations = df_sorted.drop('file', axis=1).corr()
+
+print(df_sorted)
+print(correlations)
+
+
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+df = pd.read_csv("ga_output.csv")
+
+plt.figure()
+
+plt.plot(df["iteration"], df["fittest"], label="Max Fitness")
+
+plt.plot(df["iteration"], df["mean"], label="Average Fitness")
+
+plt.legend()
+
+plt.xlabel("Generation")
+plt.ylabel("Fitness")
+
+plt.show()
+
+
+
+"""
+The script is used to analyze and visualize data stored in summary.csv from a simulation or experiment. 
+It provides statistical summaries and plots for fitness, number of links, and vertical distance metrics over time or iterations. 
+These visualizations aid in understanding the performance and evolution of the simulated system.
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Read the CSV file
+df = pd.read_csv('summary.csv')
+
+# Display basic statistics
+print(df.describe())
+
+# Plot fitness over time
+plt.figure(figsize=(10, 6))
+plt.plot(df['fitness'])
+plt.title('Fitness over time')
+plt.xlabel('CSV File')
+plt.ylabel('Fitness')
+plt.grid(True)
+plt.show()
+
+# Plot number of links over time
+plt.figure(figsize=(10, 6))
+plt.plot(df['num_links'])
+plt.title('Number of links over time')
+plt.xlabel('CSV File')
+plt.ylabel('Number of links')
+plt.grid(True)
+plt.show()
+
+# Plot vertical distance over time
+plt.figure(figsize=(10, 6))
+plt.plot(df['vertical_distance'])
+plt.title('Vertical Distance over time')
+plt.xlabel('CSV File')
+plt.ylabel('Vertical Distance')
+plt.grid(True)
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

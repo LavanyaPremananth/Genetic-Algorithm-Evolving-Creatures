@@ -1,0 +1,22 @@
+# Required packages for the project
+noise
+appnope
+backcall
+decorator
+ipython
+jedi
+matplotlib-inline
+numpy
+pandas
+parso
+pexpect
+pickleshare
+prompt-toolkit
+ptyprocess
+pybullet
+Pygments
+python-dateutil
+pytz
+six
+traitlets
+wcwidth
